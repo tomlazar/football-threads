@@ -6,6 +6,7 @@ require (
 	github.com/bwmarrin/discordgo v0.23.3-0.20210821175000-0fad116c6c2a
 	github.com/caarlos0/env v3.5.0+incompatible
 	github.com/joho/godotenv v1.3.0
+	github.com/matryer/is v1.4.0
 	github.com/pkg/errors v0.9.1
 	github.com/rs/zerolog v1.25.0
 )

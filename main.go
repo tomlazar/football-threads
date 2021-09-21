@@ -1,26 +1,30 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"text/tabwriter"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/caarlos0/env"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
+	"github.com/tomlazar/football-threads/api"
 
 	_ "github.com/joho/godotenv/autoload"
 )
 
 type State struct {
-	Thread           string
-	LastActivity     time.Time
-	FootballFacts    []string
-	RemainingTouches int
+	LastActivity  time.Time
+	LastDay       time.Time
+	Year          int
+	FootballFacts []string
 }
 
 func WriteState(state State) error {
@@ -73,7 +77,7 @@ func (gw GameWeek) ThreadName() string {
 		stop = gw.LastDay.Format("Jan _2")
 	}
 
-	return fmt.Sprintf("NBA Game Week %v (%v - %v)", gw.WeekNo, start, stop)
+	return fmt.Sprintf("NFL Game Week %v (%v - %v)", gw.WeekNo, start, stop)
 }
 
 func TimeInWeek(t time.Time, gw GameWeek) bool {
@@ -98,12 +102,17 @@ func GenerateGameWeeks(firstThrus, firstMon time.Time) map[int]GameWeek {
 func date(year, month, day int) time.Time {
 	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 }
+func today() time.Time {
+	now := time.Now()
+	return date(now.Year(), int(now.Month()), now.Day())
+}
 
 type Config struct {
 	Debug      bool   `env:"FB_THREADS_DEBUG"`
 	BotToken   string `env:"FB_THREADS_BOT_TOKEN"`
 	BotChannel string `env:"FB_THREADS_CHANNEL"`
 	BotGuild   string `env:"FB_THREADS_GUILD"`
+	ApiKey     string `env:"FB_THREADS_API_KEY"`
 }
 
 func MustLoadConfig() (bool, Config) {
@@ -121,14 +130,14 @@ func MustLoadConfig() (bool, Config) {
 	return debug, config
 }
 
-func runmain(logger zerolog.Logger, cfg Config, state State) (State, error) {
+func runmain(logger zerolog.Logger, cfg Config, state State, api *api.Api) (State, error) {
 	gw := GenerateGameWeeks(date(2021, int(time.September), 9), date(2021, int(time.September), 14))
 
 	// ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	// defer cancel()
 
 	var currentweek GameWeek
-	now := date(time.Now().Year(), int(time.Now().Month()), time.Now().Day())
+	now := today()
 
 	for week := 1; week <= 18; week++ {
 		currentweek = gw[week]
@@ -142,8 +151,7 @@ func runmain(logger zerolog.Logger, cfg Config, state State) (State, error) {
 		return state, errors.WithStack(errors.New("no current week found"))
 	}
 
-	// todo: remove the false in this check
-	if false && time.Now().Before(currentweek.LastDay) {
+	if time.Now().Before(currentweek.FirstDay) {
 		logger.Debug().Int("gw", currentweek.WeekNo).Msg("waiting for first day ofweek")
 		return state, nil
 	}
@@ -171,7 +179,7 @@ func runmain(logger zerolog.Logger, cfg Config, state State) (State, error) {
 		}
 	}
 	if target == nil {
-		channel, err := d.ThreadStartWithoutMessage(cfg.BotChannel, &discordgo.ThreadCreateData{
+		target, err = d.ThreadStartWithoutMessage(cfg.BotChannel, &discordgo.ThreadCreateData{
 			Name:                currentweek.ThreadName(),
 			Type:                discordgo.ChannelTypeGuildPublicThread,
 			AutoArchiveDuration: discordgo.ArchiveDurationOneDay,
@@ -180,16 +188,53 @@ func runmain(logger zerolog.Logger, cfg Config, state State) (State, error) {
 			return state, errors.Wrap(errors.WithStack(err), "failed to create thread")
 		}
 
-		_, err = d.ChannelMessageSend(channel.ID, "Welcome to the thread for the current game week.\n\n")
+		_, err = d.ChannelMessageSend(target.ID, "Welcome to the thread for the current game week.\n\n")
 		if err != nil {
 			return state, errors.Wrap(errors.WithStack(err), "failed to send message to thread")
 		}
+
+		logger.Info().Msg("created thread")
 		state.LastActivity = time.Now()
 	}
 
-	if time.Since(state.LastActivity) > time.Hour*16 {
+	if today() != state.LastDay {
+		var (
+			title = fmt.Sprintf("Today's games %v.", today().Format("Monday, Jan 2"))
+			body  = bytes.Buffer{}
+			tab   = tabwriter.NewWriter(&body, 0, 0, 2, ' ', 0)
+		)
+
+		games, err := api.GetGamesOnDay(context.Background(), state.Year, currentweek.WeekNo, today())
+		if err != nil {
+			return state, errors.Wrap(errors.WithStack(err), "failed to get games")
+		}
+
+		fmt.Fprintln(tab, "AWAY\tHOME\tSCHEDULED")
+		for _, game := range games {
+			fmt.Fprintf(tab, "%v\t%v\t%v\n", game.Away.Name, game.Home.Name, game.ScheduledLocal().Format("3:04 PM MST"))
+		}
+		tab.Flush()
+
+		_, err = d.ChannelMessageSendEmbed(target.ID, &discordgo.MessageEmbed{
+			Title:       title,
+			Description: fmt.Sprintf("```\n%v\n```", body.String()),
+			URL:         "https://www.espn.com/nfl/schedule",
+			Footer: &discordgo.MessageEmbedFooter{
+				Text: "Powered by GO!",
+			},
+		})
+		if err != nil {
+			return state, errors.Wrap(errors.WithStack(err), "failed to send message to thread")
+		}
+
+		logger.Info().Msg("sent daily schedule to thread")
+		state.LastActivity = time.Now()
+		state.LastDay = today()
+	}
+
+	if time.Since(state.LastActivity) > time.Hour*6 {
 		// choose the message, the default bot stuff, or the custom stuff
-		message := "Hi! I'm the NBA Threads bot. I'm here to help you keep track of the games in the NBA."
+		message := "Hi! I'm the NFL Threads bot. I'm here to help you keep track of the games in the NBA."
 		if len(state.FootballFacts) > 0 {
 			message = state.FootballFacts[rand.Int()%len(state.FootballFacts)]
 		}
@@ -198,6 +243,7 @@ func runmain(logger zerolog.Logger, cfg Config, state State) (State, error) {
 		if err != nil {
 			return state, errors.Wrap(errors.WithStack(err), "failed to send message")
 		}
+		logger.Info().Msg("sent message to thread")
 		state.LastActivity = time.Now()
 	}
 
@@ -207,6 +253,7 @@ func runmain(logger zerolog.Logger, cfg Config, state State) (State, error) {
 func main() {
 	var (
 		debug, cfg = MustLoadConfig()
+		api        = api.New(cfg.ApiKey, nil)
 
 		logger = zerolog.New(zerolog.ConsoleWriter{
 			Out:        os.Stdout,
@@ -232,7 +279,7 @@ func main() {
 	logger.Debug().Msg("starting")
 
 	// run the main loop
-	state, err = runmain(logger, cfg, state)
+	state, err = runmain(logger, cfg, state, api)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to read state")
 		os.Exit(1)
